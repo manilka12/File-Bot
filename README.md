@@ -8,7 +8,6 @@ A WhatsApp bot for document scanning, PDF manipulation, and format conversion.
 - **Document Scanning**: Convert images into scanned document PDFs
 - **Format Conversion**: Convert Word, PowerPoint, Excel files to PDF
 - **Markdown to PDF**: Convert markdown text to PDF documents
-- **PDF to Markdown**: Convert PDF documents to markdown text using vb64/markdown-pdf
 
 ## Requirements
 
@@ -21,11 +20,7 @@ See `requirements.txt` for the complete list of dependencies.
    ```
    pip install -r requirements.txt
    ```
-3. Install additional dependencies:
-   ```
-   pip install git+https://github.com/vb64/markdown-pdf.git
-   ```
-4. Set up environment variables:
+3. Set up environment variables:
    ```
    cp .env.example .env
    ```
