@@ -1,18 +1,22 @@
 import os
+from dotenv import load_dotenv
 
 """
 Configuration settings for the Document Scanner application.
 """
 
+# Load environment variables from .env file
+load_dotenv()
+
 # --- API Configuration ---
-BASE_URL = 'http://arm:8081'
-API_TOKEN = 'MnImanilka'
-INSTANCE_ID = "whatsapp"
-INSTANCE_TOKEN = "D9EC72F9C904-4812-A3A9-36CE34CBE1F2"
+BASE_URL = os.getenv('BASE_URL', 'http://localhost:8081')
+API_TOKEN = os.getenv('API_TOKEN')
+INSTANCE_ID = os.getenv('INSTANCE_ID', 'whatsapp')
+INSTANCE_TOKEN = os.getenv('INSTANCE_TOKEN')
 DOWNLOAD_BASE_DIR = os.getcwd()  # Base directory for user data (current working directory)
 
 # --- Logging Configuration ---
-LOG_LEVEL = "INFO"
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FORMAT = '%(asctime)s [%(levelname)s] %(message)s'  # Simplified format
 
 # --- Processing Configuration ---

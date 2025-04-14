@@ -25,10 +25,25 @@ See `requirements.txt` for the complete list of dependencies.
    ```
    pip install git+https://github.com/vb64/markdown-pdf.git
    ```
+4. Set up environment variables:
+   ```
+   cp .env.example .env
+   ```
+   Then edit the `.env` file with your specific configuration.
+
+## Configuration
+
+The application uses environment variables for configuration. You can set these in a `.env` file in the root directory:
+
+- `BASE_URL`: The base URL for the WhatsApp API (default: http://localhost:8081)
+- `API_TOKEN`: Your WhatsApp API token
+- `INSTANCE_ID`: The WhatsApp instance ID (default: whatsapp)
+- `INSTANCE_TOKEN`: Your WhatsApp instance token
+- `LOG_LEVEL`: Logging level (default: INFO)
 
 ## Usage
 
-1. Configure your WhatsApp client settings in `config/settings.py`
+1. Configure your environment variables in the `.env` file
 2. Run the application:
    ```
    python app/main.py

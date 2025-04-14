@@ -40,3 +40,6 @@ Thumbs.db
 
 # Large files
 scanner/Structure/Scanner-Detector.pth
+
+# Environment variables
+.env
