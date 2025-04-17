@@ -4,7 +4,7 @@ import os
 import argparse
 import itertools
 import math
-import sys  # Fix: Import sys module at the top
+import sys  
 from scipy.spatial import distance as dist
 from pylsd.lsd import lsd
 from pyimagesearch import transform

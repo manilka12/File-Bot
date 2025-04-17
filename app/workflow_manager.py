@@ -931,6 +931,7 @@ class WorkflowManager:
     def handle_markdown_to_pdf_workflow(self, sender_jid, message_text, message_id=None):
         """
         Handle markdown to PDF workflow commands and text messages.
+        Uses an integrated approach that tries multiple conversion methods.
         
         Args:
             sender_jid (str): The user's JID
@@ -950,7 +951,7 @@ class WorkflowManager:
                 
             self.whatsapp_client.send_text(sender_jid, "Converting markdown to PDF... This may take a moment.")
             
-            # Generate PDF from markdown content
+            # Generate PDF from markdown content using integrated approach with fallbacks
             result = MarkdownToPdfWorkflow.generate_pdf_from_messages(task_dir, workflow_info)
             
             if not result["success"]:
@@ -960,12 +961,16 @@ class WorkflowManager:
                 )
                 del self.active_workflows[sender_jid]
                 return
-                
+            
+            # Include the method used in the caption
+            method_name = result.get('method', 'conversion')
+            caption = f"Here is your PDF generated from markdown using {method_name}."
+            
             # Send the PDF to the user
             _, sent_id = self.whatsapp_client.send_media(
                 sender_jid,
                 result["path"],
-                "Here is your PDF generated from markdown text."
+                caption
             )
             
             # Cleanup
@@ -976,10 +981,14 @@ class WorkflowManager:
                     "sent_id": sent_id
                 }]
                 
-                # No input files to clean as they're just part of workflow_info
+                # Include the markdown file if it was created
+                input_files = []
+                if "source_md" in result:
+                    input_files = [os.path.basename(result["source_md"])]
+                
                 cleanup_task_universal(
                     task_dir,
-                    [], # No physical input files to clean
+                    input_files,
                     output_files
                 )
                 
@@ -1069,7 +1078,8 @@ class WorkflowManager:
                     self.start_workflow(sender_jid, "compress")
                     return
 
-                elif command == 'markdown to pdf':
+                elif command in ['markdown to pdf', 'markdown2 to pdf']:
+                    # Both commands now use the same consolidated workflow
                     self.start_workflow(sender_jid, "markdown_to_pdf")
                     return
             

@@ -1,0 +1,13 @@
+dotenv
+evolutionapi
+pypdf
+Pillow
+websocket-client
+opencv-python
+scipy
+ocrd-fork-pylsd
+torch
+scikit-image
+numpy
+# markdown
+md2pdf
