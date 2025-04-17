@@ -1,0 +1,3 @@
+sudo apt install libreoffice
+npm install -g markdown-pdf --ignore-scripts
+npm i -g md-to-pdf
