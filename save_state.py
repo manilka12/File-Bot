@@ -7,7 +7,7 @@ import sys # Import sys for sys.exit
 
 def run_command(command):
     """Run a shell command and return its output."""
-    print(f"Executing: {command}") # Added for debugging
+    #print(f"Executing: {command}") # Added for debugging
     try:
         # Using list format is generally safer than shell=True
         if isinstance(command, str):
