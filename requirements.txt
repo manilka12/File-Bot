@@ -1,0 +1,27 @@
+# Core dependencies
+evolutionapi
+pypdf
+Pillow
+python-dotenv
+websocket-client
+opencv-python
+scipy
+ocrd-fork-pylsd
+torch
+scikit-image
+numpy
+md2pdf
+redis
+celery
+
+# Testing dependencies
+pytest
+pytest-cov
+
+# Linting and formatting
+flake8
+black
+mypy
+
+# Optional: pre-commit hooks
+pre-commit

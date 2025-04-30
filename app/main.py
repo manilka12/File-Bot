@@ -11,16 +11,17 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import LOG_LEVEL, LOG_FORMAT
+from utils.logging_utils import setup_logger, set_context
 from app.whatsapp_client import WhatsAppClient
 from app.workflow_manager import WorkflowManager
 
 def setup_logging():
     """Configure logging for the application."""
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL),
-        format=LOG_FORMAT
-    )
-    return logging.getLogger(__name__)
+    # Set default context values for root logger
+    set_context(task_id="main", sender_jid="system")
+    
+    # Setup root logger with our utilities
+    return setup_logger("document_scanner", LOG_LEVEL, LOG_FORMAT)
 
 def main():
     """Main entry point for the application."""

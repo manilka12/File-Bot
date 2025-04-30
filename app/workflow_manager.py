@@ -7,7 +7,11 @@ import uuid
 import base64
 import logging
 from utils.file_utils import cleanup_task_universal, read_order_file
+from utils.logging_utils import setup_logger, set_context, with_context
+from utils.persistence import get_state_manager
+from app.exceptions import StateManagementError
 
+from workflows.base import BaseWorkflow
 from workflows.merge_workflow import MergeWorkflow
 from workflows.split_workflow import SplitWorkflow
 from workflows.scan_workflow import ScanWorkflow
@@ -19,10 +23,23 @@ from workflows.markdown_to_pdf_workflow import MarkdownToPdfWorkflow
 
 from config.settings import DOWNLOAD_BASE_DIR
 
-logger = logging.getLogger(__name__)
+# Setup logger with our enhanced logging utilities
+logger = setup_logger(__name__)
 
 class WorkflowManager:
     """Manages workflows for document processing tasks."""
+    
+    # Map workflow types to their respective classes
+    WORKFLOW_CLASSES = {
+        "merge": MergeWorkflow,
+        "split": SplitWorkflow,
+        "scan": ScanWorkflow,
+        "word_to_pdf": WordToPdfWorkflow,
+        "powerpoint_to_pdf": PowerPointToPdfWorkflow,
+        "excel_to_pdf": ExcelToPdfWorkflow,
+        "compress": CompressPdfWorkflow,
+        "markdown_to_pdf": MarkdownToPdfWorkflow
+    }
     
     def __init__(self, whatsapp_client):
         """
@@ -32,74 +49,230 @@ class WorkflowManager:
             whatsapp_client: Instance of WhatsAppClient
         """
         self.whatsapp_client = whatsapp_client
-        self.active_workflows = {}
         
+        try:
+            # Initialize the state manager for persistent workflow state
+            self.state_manager = get_state_manager()
+            
+            # Check what type of state manager we're using
+            from utils.persistence import RedisStateManager
+            if isinstance(self.state_manager, RedisStateManager):
+                logger.info("WorkflowManager initialized with Redis state persistence")
+            else:
+                logger.info("WorkflowManager initialized with in-memory state persistence")
+                
+        except StateManagementError as e:
+            logger.error(f"Failed to initialize state persistence: {str(e)}")
+            logger.warning("Falling back to in-memory state management")
+            self.state_manager = None
+            self.active_workflows = {}  # Fallback to in-memory storage
+            logger.info("WorkflowManager initialized with in-memory state persistence")
+    
+    def _get_workflow_instance(self, sender_jid):
+        """
+        Get the workflow instance for a user.
+        
+        Args:
+            sender_jid (str): The user's JID
+            
+        Returns:
+            BaseWorkflow: Workflow instance or None if not found
+        """
+        # Get workflow data from persistence
+        workflow_data = self._get_workflow_state(sender_jid)
+        if not workflow_data:
+            return None
+            
+        # Extract workflow type
+        workflow_type = workflow_data.get("workflow_type")
+        if not workflow_type:
+            logger.error(f"Missing workflow type in persisted data for {sender_jid}")
+            return None
+            
+        # Handle variations in workflow type formats
+        if workflow_type not in self.WORKFLOW_CLASSES:
+            # Try alternative formats
+            normalized_type = workflow_type.replace("_pdf", "").replace("pdf_", "")
+            
+            # Handle specific cases
+            if workflow_type == "word_to_pdf":
+                normalized_type = "word_to_pdf"
+            elif workflow_type == "powerpoint_to_pdf" or workflow_type == "power_point_to_pdf":
+                normalized_type = "powerpoint_to_pdf"
+            elif workflow_type == "excel_to_pdf":
+                normalized_type = "excel_to_pdf" 
+            elif workflow_type == "markdown_to_pdf":
+                normalized_type = "markdown_to_pdf"
+            
+            if normalized_type in self.WORKFLOW_CLASSES:
+                logger.info(f"Normalized workflow type from '{workflow_type}' to '{normalized_type}'")
+                workflow_type = normalized_type
+                # Update the stored data for future lookups
+                workflow_data["workflow_type"] = normalized_type
+            else:
+                logger.error(f"Invalid workflow type in persisted data: {workflow_type}")
+                return None
+            
+        # Get the workflow class
+        workflow_class = self.WORKFLOW_CLASSES[workflow_type]
+        
+        # Create an instance from persisted data
+        try:
+            workflow_data["sender_jid"] = sender_jid
+            workflow_instance = workflow_class.from_dict(workflow_data, self.whatsapp_client)
+            return workflow_instance
+        except Exception as e:
+            logger.error(f"Error creating workflow instance: {str(e)}")
+            return None
+    
+    def _save_workflow_instance(self, sender_jid, workflow_instance):
+        """
+        Save a workflow instance.
+        
+        Args:
+            sender_jid (str): The user's JID
+            workflow_instance (BaseWorkflow): The workflow instance
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Convert instance to dict for persistence
+            workflow_data = workflow_instance.to_dict()
+            # Add sender_jid to the data
+            workflow_data["sender_jid"] = sender_jid
+            # Save to persistence
+            return self._save_workflow_state(sender_jid, workflow_data)
+        except Exception as e:
+            logger.error(f"Error saving workflow instance: {str(e)}")
+            return False
+    
+    def _get_workflow_state(self, sender_jid):
+        """
+        Get the workflow state for a user.
+        
+        Args:
+            sender_jid (str): The user's JID
+            
+        Returns:
+            dict: Workflow state or None if not found
+        """
+        if self.state_manager:
+            try:
+                return self.state_manager.load_workflow_state(sender_jid)
+            except StateManagementError as e:
+                logger.error(f"Error loading workflow state: {str(e)}")
+                return self.active_workflows.get(sender_jid) if hasattr(self, 'active_workflows') else None
+        else:
+            return self.active_workflows.get(sender_jid)
+    
+    def _save_workflow_state(self, sender_jid, state):
+        """
+        Save the workflow state for a user.
+        
+        Args:
+            sender_jid (str): The user's JID
+            state (dict): Workflow state to save
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if self.state_manager:
+            try:
+                return self.state_manager.save_workflow_state(sender_jid, state)
+            except StateManagementError as e:
+                logger.error(f"Error saving workflow state: {str(e)}")
+                if hasattr(self, 'active_workflows'):
+                    self.active_workflows[sender_jid] = state
+                return False
+        else:
+            self.active_workflows[sender_jid] = state
+            return True
+    
+    def _delete_workflow_state(self, sender_jid):
+        """
+        Delete the workflow state for a user.
+        
+        Args:
+            sender_jid (str): The user's JID
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if self.state_manager:
+            try:
+                return self.state_manager.delete_workflow_state(sender_jid)
+            except StateManagementError as e:
+                logger.error(f"Error deleting workflow state: {str(e)}")
+                if hasattr(self, 'active_workflows') and sender_jid in self.active_workflows:
+                    del self.active_workflows[sender_jid]
+                return False
+        else:
+            if sender_jid in self.active_workflows:
+                del self.active_workflows[sender_jid]
+            return True
+    
+    @with_context(task_id="workflow_start", sender_jid="system")
     def start_workflow(self, sender_jid, workflow_type):
         """
         Start a new workflow for a user.
         
         Args:
             sender_jid (str): The user's JID
-            workflow_type (str): Type of workflow ('merge', 'split', 'scan', 'word_to_pdf', 'powerpoint_to_pdf', 'excel_to_pdf', 'compress', or 'markdown_to_pdf')
+            workflow_type (str): Type of workflow ('merge', 'split', 'scan', etc.)
             
         Returns:
             tuple: (success, message)
         """
-        # Define initial state based on workflow type
-        initial_state = {}
-        instruction_message = ""
+        # Update logging context for this specific workflow start
+        set_context(sender_jid=sender_jid, task_id="workflow_start")
+        logger.info(f"Starting {workflow_type} workflow")
         
-        if workflow_type == "merge":
-            initial_state = {"merge_order": {}}
-            instruction_message = "Started PDF Merge. Send PDFs one by one.\nReply to a PDF with just a number (e.g., '1') to change order.\nSend 'done' when finished."
-        elif workflow_type == "split":
-            initial_state = {"split_files": {}}
-            instruction_message = "Started PDF Split. Send the PDF file to split.\nThen, *reply to that PDF message* with page ranges (e.g., '1-10', '15', '20-25', one per line or comma-separated)."
-        elif workflow_type == "scan":
-            initial_state = {"scan_order": {}, "images": []}
-            instruction_message = "Started Document Scan. Send images one by one.\nReply to an image with a number to change order.\nSend 'done' when finished."
-        elif workflow_type == "word_to_pdf":
-            initial_state = {}
-            instruction_message = "Started Word to PDF conversion. Send your Word documents (.doc or .docx) one by one.\nSend 'done' when you've sent all documents to convert."
-        elif workflow_type == "powerpoint_to_pdf":
-            initial_state = {}
-            instruction_message = "Started PowerPoint to PDF conversion. Send your PowerPoint presentations (.ppt, .pptx, .pps, or .ppsx) one by one.\nSend 'done' when you've sent all presentations to convert."
-        elif workflow_type == "excel_to_pdf":
-            initial_state = {}
-            instruction_message = "Started Excel to PDF conversion. Send your Excel spreadsheets (.xls, .xlsx, .xlsm, .xlsb, or .csv) one by one.\nSend 'done' when you've sent all spreadsheets to convert."
-        elif workflow_type == "compress":
-            initial_state = {"compress_files": {}}
-            instruction_message = "Started PDF Compression. Send your PDF files one by one, and I'll help you compress them to reduce file size while maintaining quality.\nFor each PDF, you can choose compression level: 'low', 'medium', 'high', 'max', or 'auto'.\nSend 'done' when you've sent all PDFs to compress."
-        elif workflow_type == "markdown_to_pdf":
-            initial_state = {"markdown_content": [], "message_ids": []}
-            instruction_message = "Started Markdown to PDF conversion. Send your markdown text messages one by one. All messages will be combined in sequence.\nUse standard markdown formatting (# for headings, ** for bold, etc.).\nSend 'done' when you've finished sending all markdown text."
-        else:
+        # Check if workflow type is valid
+        if workflow_type not in self.WORKFLOW_CLASSES:
+            logger.error(f"Invalid workflow type requested: {workflow_type}")
             return False, "Invalid workflow type."
+        
+        workflow_class = self.WORKFLOW_CLASSES[workflow_type]
         
         # Create task directory
         task_id = str(uuid.uuid4())
         safe_sender_jid = "".join(c if c.isalnum() else "_" for c in sender_jid)
         task_dir = os.path.join(DOWNLOAD_BASE_DIR, safe_sender_jid, task_id)
         
+        # Update logging context with the generated task_id
+        set_context(task_id=task_id)
+        
         try:
             os.makedirs(task_dir, exist_ok=True)
             
-            # Initialize new workflow
-            self.active_workflows[sender_jid] = {
-                "task_id": task_id,
-                "task_dir": task_dir,
-                "workflow_type": workflow_type,
-                **initial_state
-            }
+            # Create new workflow instance
+            workflow_instance = workflow_class(
+                task_id=task_id,
+                task_dir=task_dir,
+                sender_jid=sender_jid,
+                whatsapp_client=self.whatsapp_client
+            )
+            
+            # Save the workflow instance
+            if not self._save_workflow_instance(sender_jid, workflow_instance):
+                raise StateManagementError("Failed to save workflow state")
+            
+            logger.info(f"Created task directory: {task_dir}")
+            
+            # Get instructions from workflow class
+            instruction_message = workflow_class.get_instructions()
             
             # Send instructions to user
             self.whatsapp_client.send_text(sender_jid, instruction_message)
+            logger.info("Instructions sent to user")
             return True, task_dir
             
         except Exception as e:
-            logger.error(f"Failed to start {workflow_type} workflow: {str(e)}")
+            logger.error(f"Failed to start workflow: {str(e)}")
             return False, f"Sorry, failed to start the {workflow_type} process."
     
+    @with_context()
     def handle_pdf_save(self, sender_jid, message_data):
         """
         Handle saving PDF files for any workflow.
@@ -111,12 +284,14 @@ class WorkflowManager:
         Returns:
             str: Saved filename if successful, None otherwise
         """
-        if sender_jid not in self.active_workflows:
+        # Get workflow instance for this user
+        workflow_instance = self._get_workflow_instance(sender_jid)
+        if not workflow_instance:
+            logger.warning(f"Received PDF from user without active workflow: {sender_jid}")
             return None
 
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        wf_type = workflow_info["workflow_type"]
+        # Set context for consistent logging
+        set_context(sender_jid=sender_jid, task_id=workflow_instance.task_id)
         
         # Extract message info
         message_id = message_data.get('key', {}).get('id')
@@ -125,41 +300,58 @@ class WorkflowManager:
         doc_message = message_holder.get('documentMessage', {})
         mimetype = doc_message.get('mimetype')
         
+        # Extract original filename from document message
+        original_filename = doc_message.get('fileName')
+        
         if not all([message_id, base64_string, mimetype == 'application/pdf']):
+            logger.warning("Invalid PDF message format")
             return None
 
         saved_filename = f"{message_id}.pdf"
-        file_path = os.path.join(task_dir, saved_filename)
+        file_path = os.path.join(workflow_instance.task_dir, saved_filename)
         
         try:
             # Save PDF
             with open(file_path, 'wb') as f:
                 f.write(base64.b64decode(base64_string))
 
-            if wf_type == "merge":
-                return MergeWorkflow.handle_pdf_save(task_dir, message_id, saved_filename)
+            logger.info(f"Saved PDF: {saved_filename}, Original name: {original_filename}")
             
-            elif wf_type == "split":
-                result, message = SplitWorkflow.handle_pdf_save(task_dir, message_id, saved_filename, workflow_info)
-                if message:
-                    self.whatsapp_client.send_text(sender_jid, message)
-                return result
+            # Store original filename in the workflow state for ALL workflows (not just compress)
+            if original_filename:
+                workflow_instance.state["original_filename"] = original_filename
+                logger.info(f"Stored original filename in workflow state: {original_filename}")
+            
+            # Still maintain backward compatibility with compress workflow
+            if original_filename and workflow_instance.__class__.__name__ == "CompressPdfWorkflow":
+                if "original_filenames" not in workflow_instance.state:
+                    workflow_instance.state["original_filenames"] = {}
+                workflow_instance.state["original_filenames"][message_id] = original_filename
+                logger.info(f"Stored original filename for {message_id}: {original_filename}")
+            
+            # Store document message info in workflow state
+            workflow_instance.state["document_message"] = doc_message
+            
+            # Let the workflow instance handle the file
+            result, message = workflow_instance.handle_file_save(message_id, saved_filename)
+            
+            # Save updated workflow state
+            self._save_workflow_instance(sender_jid, workflow_instance)
+            
+            # Send any response message to the user (if not already sent by the workflow)
+            if message and self.whatsapp_client:
+                self.whatsapp_client.send_text(sender_jid, message)
                 
-            elif wf_type == "compress":
-                result, message = CompressPdfWorkflow.handle_pdf_save(task_dir, message_id, saved_filename, workflow_info)
-                if message:
-                    self.whatsapp_client.send_text(sender_jid, message)
-                return result
-
-            return saved_filename
+            return result
 
         except Exception as e:
             logger.error(f"Failed to save PDF: {str(e)}")
             return None
-    
-    def handle_image_save(self, sender_jid, message_data):
+
+    @with_context()
+    def handle_document_save(self, sender_jid, message_data):
         """
-        Handle saving images for scan workflow.
+        Handle saving document files for document conversion workflows.
         
         Args:
             sender_jid (str): The user's JID
@@ -168,14 +360,90 @@ class WorkflowManager:
         Returns:
             str: Saved filename if successful, None otherwise
         """
-        if sender_jid not in self.active_workflows:
+        # Get workflow instance for this user
+        workflow_instance = self._get_workflow_instance(sender_jid)
+        if not workflow_instance:
+            logger.warning(f"Received document from user without active workflow: {sender_jid}")
             return None
 
-        workflow_info = self.active_workflows[sender_jid]
-        if workflow_info["workflow_type"] != "scan":
+        # Set context for consistent logging
+        set_context(sender_jid=sender_jid, task_id=workflow_instance.task_id)
+        
+        # Extract message info
+        message_id = message_data.get('key', {}).get('id')
+        message_holder = message_data.get('message', {})
+        base64_string = message_holder.get('base64')
+        doc_message = message_holder.get('documentMessage', {})
+        mimetype = doc_message.get('mimetype')
+        filename = doc_message.get('fileName', f"{message_id}_file")
+        
+        if not all([message_id, base64_string]):
+            logger.warning("Invalid document message format")
             return None
 
-        task_dir = workflow_info["task_dir"]
+        # Determine file extension from mimetype or filename
+        if '.' in filename:
+            _, ext = os.path.splitext(filename)
+        else:
+            # Guess extension based on mimetype
+            if 'word' in mimetype:
+                ext = '.docx'
+            elif 'powerpoint' in mimetype or 'presentation' in mimetype:
+                ext = '.pptx'
+            elif 'excel' in mimetype or 'sheet' in mimetype:
+                ext = '.xlsx'
+            else:
+                ext = '.bin'  # generic binary file
+        
+        saved_filename = f"{message_id}{ext}"
+        file_path = os.path.join(workflow_instance.task_dir, saved_filename)
+        
+        try:
+            # Save document file
+            with open(file_path, 'wb') as f:
+                f.write(base64.b64decode(base64_string))
+
+            logger.info(f"Saved document: {saved_filename}")
+            
+            # Store document message info in workflow state
+            workflow_instance.state["document_message"] = doc_message
+            
+            # Let the workflow instance handle the file
+            result, message = workflow_instance.handle_file_save(message_id, saved_filename)
+            
+            # Save updated workflow state
+            self._save_workflow_instance(sender_jid, workflow_instance)
+            
+            # Send any response message to the user (if not already sent by the workflow)
+            if message and self.whatsapp_client:
+                self.whatsapp_client.send_text(sender_jid, message)
+                
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to save document: {str(e)}")
+            return None
+            
+    @with_context()
+    def handle_image_save(self, sender_jid, message_data):
+        """
+        Handle saving image files for scan workflow.
+        
+        Args:
+            sender_jid (str): The user's JID
+            message_data (dict): The message data
+            
+        Returns:
+            str: Saved filename if successful, None otherwise
+        """
+        # Get workflow instance for this user
+        workflow_instance = self._get_workflow_instance(sender_jid)
+        if not workflow_instance:
+            logger.warning(f"Received image from user without active workflow: {sender_jid}")
+            return None
+
+        # Set context for consistent logging
+        set_context(sender_jid=sender_jid, task_id=workflow_instance.task_id)
         
         # Extract message info
         message_id = message_data.get('key', {}).get('id')
@@ -184,831 +452,278 @@ class WorkflowManager:
         img_message = message_holder.get('imageMessage', {})
         mimetype = img_message.get('mimetype')
         
-        if not all([message_id, base64_string, mimetype and mimetype.startswith('image/')]):
+        if not all([message_id, base64_string, mimetype.startswith('image/')]):
+            logger.warning("Invalid image message format")
             return None
 
-        saved_filename = f"{message_id}.jpg"
-        file_path = os.path.join(task_dir, saved_filename)
+        # Determine file extension from mimetype
+        if 'jpeg' in mimetype or 'jpg' in mimetype:
+            ext = '.jpg'
+        elif 'png' in mimetype:
+            ext = '.png'
+        else:
+            ext = '.jpg'  # default to jpg
+        
+        saved_filename = f"{message_id}{ext}"
+        file_path = os.path.join(workflow_instance.task_dir, saved_filename)
         
         try:
-            # Save original image
+            # Save image file
             with open(file_path, 'wb') as f:
                 f.write(base64.b64decode(base64_string))
+
+            logger.info(f"Saved image: {saved_filename}")
             
-            logger.info(f"Original image saved to: {file_path}")
+            try:
+                # Let the workflow instance handle the file - Use instance method directly
+                result, message = workflow_instance.handle_image_save(message_id, saved_filename)
+            except Exception as e:
+                logger.error(f"Failed to save image: {str(e)}")
+                return None
             
-            # Process image and update workflow
-            result, message = ScanWorkflow.handle_image_save(task_dir, message_id, saved_filename, workflow_info)
-            if message:
+            # Save updated workflow state
+            self._save_workflow_instance(sender_jid, workflow_instance)
+            
+            # Send any response message to the user (if not already sent by the workflow)
+            if message and self.whatsapp_client:
                 self.whatsapp_client.send_text(sender_jid, message)
-            
+                
             return result
-            
+
         except Exception as e:
-            logger.error(f"Failed to save/process image: {str(e)}")
-            if os.path.exists(file_path):
-                logger.info("Original image was saved but processing failed")
-                return saved_filename
+            logger.error(f"Failed to save image: {str(e)}")
             return None
-    
-    def handle_document_save(self, sender_jid, message_data):
+
+    def _handle_workflow_command(self, sender_jid, message_text, quoted_stanza_id):
         """
-        Handle saving document files (Word, PowerPoint, Excel, PDF) for document-based workflows.
+        Handle workflow text commands.
         
         Args:
             sender_jid (str): The user's JID
-            message_data (dict): The message data
+            message_text (str): The message text
+            quoted_stanza_id (str): ID of the quoted message (if any)
             
         Returns:
-            str: Saved filename if successful, None otherwise
+            bool: True if handled, False otherwise
         """
-        if sender_jid not in self.active_workflows:
-            return None
-
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        wf_type = workflow_info["workflow_type"]
-        
-        # Extract message info
-        message_id = message_data.get('key', {}).get('id')
-        message_holder = message_data.get('message', {})
-        base64_string = message_holder.get('base64')
-        doc_message = message_holder.get('documentMessage', {})
-        mimetype = doc_message.get('mimetype')
-        filename = doc_message.get('fileName', '')
-        
-        if not all([message_id, base64_string, mimetype]):
-            return None
-
-        # Save original filename in workflow_info
-        if filename:
-            if 'original_filenames' not in workflow_info:
-                workflow_info['original_filenames'] = {}
-            workflow_info['original_filenames'][message_id] = filename
-            logger.info(f"Saved original filename: {filename} for message {message_id}")
+        # Get workflow instance for this user
+        workflow_instance = self._get_workflow_instance(sender_jid)
+        if not workflow_instance:
+            return False
             
-        # For PDF files, use handle_pdf_save instead
-        if mimetype == 'application/pdf':
-            return self.handle_pdf_save(sender_jid, message_data)
+        # Set context for consistent logging
+        set_context(sender_jid=sender_jid, task_id=workflow_instance.task_id)
+        
+        try:
+            # Make sure we're using instance method, not static method
+            workflow_class_name = workflow_instance.__class__.__name__
+            task_dir = workflow_instance.task_dir
             
-        # For Word files in word_to_pdf workflow
-        if wf_type == "word_to_pdf" and (mimetype in [
-            'application/msword',  # .doc
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'  # .docx
-        ] or filename.lower().endswith(('.doc', '.docx'))):
-            # Determine file extension based on mimetype or filename
-            if mimetype == 'application/msword' or filename.lower().endswith('.doc'):
-                ext = '.doc'
+            # Use the proper method based on whether it's instance or static
+            if hasattr(workflow_instance, 'handle_command') and callable(workflow_instance.handle_command):
+                # Use instance method directly
+                logger.debug(f"Using instance method handle_command for {workflow_class_name}")
+                is_done, response_message = workflow_instance.handle_command(message_text, quoted_stanza_id)
             else:
-                ext = '.docx'
-                
-            saved_filename = f"{message_id}{ext}"
-            file_path = os.path.join(task_dir, saved_filename)
+                # Fallback to static method (should not happen after refactoring)
+                logger.warning(f"Falling back to static handle_command for {workflow_class_name}")
+                is_done, response_message = workflow_instance.__class__.handle_command(
+                    task_dir, message_text, quoted_stanza_id, workflow_instance.state)
             
-            try:
-                # Save Word document
-                with open(file_path, 'wb') as f:
-                    f.write(base64.b64decode(base64_string))
+            # Save updated workflow state
+            self._save_workflow_instance(sender_jid, workflow_instance)
+            
+            # Send response if any (if not already sent by the workflow)
+            if response_message and self.whatsapp_client:
+                self.whatsapp_client.send_text(sender_jid, response_message)
+            
+            # If workflow is done, finalize it
+            if is_done:
+                self._finalize_workflow(sender_jid)
                 
-                logger.info(f"Word document saved to: {file_path}")
-                
-                # Process document and update workflow
-                result, message = WordToPdfWorkflow.handle_document_save(task_dir, message_id, saved_filename, workflow_info)
-                if message:
-                    self.whatsapp_client.send_text(sender_jid, message)
-                
-                return result
-                
-            except Exception as e:
-                logger.error(f"Failed to save/process Word document: {str(e)}")
-                return None
+            return True
         
-        # For PowerPoint files in powerpoint_to_pdf workflow
-        if wf_type == "powerpoint_to_pdf" and (mimetype in [
-            'application/vnd.ms-powerpoint',  # .ppt
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation',  # .pptx
-            'application/vnd.ms-powerpoint.presentation.macroEnabled.12',  # .pptm
-            'application/vnd.openxmlformats-officedocument.presentationml.slideshow',  # .ppsx
-            'application/vnd.ms-powerpoint.slideshow.macroEnabled.12'  # .ppsm
-        ] or filename.lower().endswith(('.ppt', '.pptx', '.pptm', '.pps', '.ppsx', '.ppsm'))):
-            # Determine file extension based on mimetype or filename
-            if filename.lower().endswith(('.ppt', '.pptx', '.pptm', '.pps', '.ppsx', '.ppsm')):
-                ext = os.path.splitext(filename)[1].lower()
-            elif mimetype == 'application/vnd.ms-powerpoint':
-                ext = '.ppt'
-            elif mimetype == 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
-                ext = '.pptx'
-            elif mimetype == 'application/vnd.openxmlformats-officedocument.presentationml.slideshow':
-                ext = '.ppsx'
-            else:
-                ext = '.pptx'  # Default to .pptx for unknown PowerPoint mimetypes
-                
-            saved_filename = f"{message_id}{ext}"
-            file_path = os.path.join(task_dir, saved_filename)
-            
-            try:
-                # Save PowerPoint presentation
-                with open(file_path, 'wb') as f:
-                    f.write(base64.b64decode(base64_string))
-                
-                logger.info(f"PowerPoint presentation saved to: {file_path}")
-                
-                # Process presentation and update workflow
-                result, message = PowerPointToPdfWorkflow.handle_presentation_save(task_dir, message_id, saved_filename, workflow_info)
-                if message:
-                    self.whatsapp_client.send_text(sender_jid, message)
-                
-                return result
-                
-            except Exception as e:
-                logger.error(f"Failed to save/process PowerPoint presentation: {str(e)}")
-                return None
-        
-        # For Excel files in excel_to_pdf workflow
-        if wf_type == "excel_to_pdf" and (mimetype in [
-            'application/vnd.ms-excel',  # .xls
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # .xlsx
-            'application/vnd.ms-excel.sheet.macroEnabled.12',  # .xlsm
-            'application/vnd.ms-excel.sheet.binary.macroEnabled.12',  # .xlsb
-            'text/csv'  # .csv
-        ] or filename.lower().endswith(('.xls', '.xlsx', '.xlsm', '.xlsb', '.csv'))):
-            # Determine file extension based on mimetype or filename
-            if filename.lower().endswith(('.xls', '.xlsx', '.xlsm', '.xlsb', '.csv')):
-                ext = os.path.splitext(filename)[1].lower()
-            elif mimetype == 'application/vnd.ms-excel':
-                ext = '.xls'
-            elif mimetype == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
-                ext = '.xlsx'
-            elif mimetype == 'text/csv':
-                ext = '.csv'
-            else:
-                ext = '.xlsx'  # Default to .xlsx for unknown Excel mimetypes
-                
-            saved_filename = f"{message_id}{ext}"
-            file_path = os.path.join(task_dir, saved_filename)
-            
-            try:
-                # Save Excel spreadsheet
-                with open(file_path, 'wb') as f:
-                    f.write(base64.b64decode(base64_string))
-                
-                logger.info(f"Excel spreadsheet saved to: {file_path}")
-                
-                # Process spreadsheet and update workflow
-                result, message = ExcelToPdfWorkflow.handle_spreadsheet_save(task_dir, message_id, saved_filename, workflow_info)
-                if message:
-                    self.whatsapp_client.send_text(sender_jid, message)
-                
-                return result
-                
-            except Exception as e:
-                logger.error(f"Failed to save/process Excel spreadsheet: {str(e)}")
-                return None
-                
-        return None
+        except Exception as e:
+            logger.error(f"Error handling workflow command: {str(e)}", exc_info=True)
+            if self.whatsapp_client:
+                self.whatsapp_client.send_text(sender_jid, "Error processing your command. Please try again.")
+            return True  # We still handled it, even though it errored
     
-    def handle_order_override(self, sender_jid, quoted_stanza_id, new_order_str):
+    def _finalize_workflow(self, sender_jid):
         """
-        Handle order override for merge and scan workflows.
+        Finalize a workflow and send results to the user.
         
         Args:
             sender_jid (str): The user's JID
-            quoted_stanza_id (str): ID of the quoted message
-            new_order_str (str): New order as string
         """
-        if sender_jid not in self.active_workflows:
+        # Get workflow instance for this user
+        workflow_instance = self._get_workflow_instance(sender_jid)
+        if not workflow_instance:
             return
             
-        workflow_info = self.active_workflows[sender_jid]
-        wf_type = workflow_info.get("workflow_type")
-        if wf_type not in ["merge", "scan"]:
-            return
+        # Set context for consistent logging
+        set_context(sender_jid=sender_jid, task_id=workflow_instance.task_id)
+        
+        task_dir = workflow_instance.task_dir
+        workflow_type = workflow_instance.__class__.__name__.replace("Workflow", "").lower()
+        source_files = []  # Initialize with empty list
+        output_files = []  # Initialize with empty list
+        success = False
+        error_message = None
+        
+        try:
+            logger.info(f"Finalizing {workflow_type} workflow for user {sender_jid}")
             
-        task_dir = workflow_info["task_dir"]
-        
-        # Determine file extension based on workflow type
-        extension = ".pdf" if wf_type == "merge" else ".jpg"
-        target_filename = f"{quoted_stanza_id}{extension}"
-        
-        if wf_type == "merge":
-            success, message = MergeWorkflow.handle_order_override(task_dir, target_filename, new_order_str)
-        else:  # scan
-            success, message = ScanWorkflow.handle_order_override(task_dir, target_filename, new_order_str)
-        
-        self.whatsapp_client.send_text(sender_jid, message)
-    
-    def handle_merge_workflow(self, sender_jid, message_text, quoted_stanza_id):
-        """
-        Handle merge workflow commands.
-        
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-            quoted_stanza_id (str): ID of the quoted message
-        """
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        
-        if message_text.lower() == 'done':
-            order_data = read_order_file(task_dir)
-            if not order_data:
-                self.whatsapp_client.send_text(sender_jid, "No PDFs received for merge.")
-                del self.active_workflows[sender_jid]
-                return
+            # Finalize the workflow and get output files
+            output_files_paths = workflow_instance.finalize()
+            
+            # Convert output paths to format expected by cleanup_task_universal
+            if output_files_paths:
+                output_files = [{"path": path, "sent_id": os.path.basename(path)} for path in output_files_paths]
                 
-            merged_pdf_path, missing_files = MergeWorkflow.merge_pdfs_in_order(task_dir, order_data)
-            sent_message_id = None
-            final_output_files = []
-
-            if merged_pdf_path:
-                _, sent_message_id = self.whatsapp_client.send_media(
-                    sender_jid, 
-                    merged_pdf_path, 
-                    "Here is your merged PDF."
-                )
-                if sent_message_id:
-                    final_output_files.append({
-                        "path": merged_pdf_path,
-                        "sent_id": sent_message_id
-                    })
-
-            should_cleanup = (merged_pdf_path is None) or (sent_message_id is not None)
-            if should_cleanup:
-                cleanup_task_universal(
-                    task_dir,
-                    list(order_data.keys()),
-                    final_output_files
-                )
-                del self.active_workflows[sender_jid]
-
-        elif quoted_stanza_id and message_text.isdigit():
-            self.handle_order_override(sender_jid, quoted_stanza_id, message_text)
-    
-    def handle_split_workflow(self, sender_jid, message_text, quoted_stanza_id):
-        """
-        Handle split workflow commands.
-        
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-            quoted_stanza_id (str): ID of the quoted message
-        """
-        if not quoted_stanza_id or not message_text:
-            return
-
-        workflow_info = self.active_workflows[sender_jid]
-        split_files = workflow_info.get("split_files", {})
-        task_dir = workflow_info["task_dir"]
-
-        if quoted_stanza_id in split_files:
-            source_filename = split_files[quoted_stanza_id]
-            source_path = os.path.join(task_dir, source_filename)
-
-            try:
-                from pypdf import PdfReader
-                reader = PdfReader(source_path)
-                total_pages = len(reader.pages)
+                # Find source files - we'll consider all PDF files that aren't in output_files
+                try:
+                    all_files = [f for f in os.listdir(task_dir) if f.endswith('.pdf')]
+                    output_basenames = [os.path.basename(path) for path in output_files_paths]
+                    source_files = [f for f in all_files if f not in output_basenames]
+                    logger.debug(f"Found {len(source_files)} source files and {len(output_files)} output files")
+                except Exception as e:
+                    # Don't let file listing errors stop the workflow, just log them
+                    logger.error(f"Error listing files in task directory: {str(e)}", exc_info=True)
+            
+            # Send output files to the user
+            if output_files_paths and self.whatsapp_client:
+                self.whatsapp_client.send_text(sender_jid, f"Task complete! Sending {len(output_files_paths)} file(s)...")
                 
-                # Parse the ranges first
-                ranges, error = SplitWorkflow.parse_page_ranges(message_text, total_pages)
-                if error:
-                    self.whatsapp_client.send_text(sender_jid, f"Invalid page range: {error}")
-                    return
-
-                if not ranges:
-                    self.whatsapp_client.send_text(sender_jid, "Please specify valid page ranges")
-                    return
-
-                # Generate split definitions
-                split_definitions = SplitWorkflow.generate_split_definitions(ranges, total_pages)
-                split_parts = SplitWorkflow.perform_split(task_dir, source_filename, split_definitions)
+                # Create a mapping of file paths to display names
+                display_names = {}
                 
-                # Handle the output files
-                output_files = []
-                sent_count = 0
-
-                for part in split_parts:
-                    _, sent_id = self.whatsapp_client.send_media(
-                        sender_jid,
-                        part["path"],
-                        f"Pages {part['range']}"
-                    )
-                    if sent_id:
-                        sent_count += 1
-                        output_files.append({
-                            "path": part["path"],
-                            "sent_id": sent_id
-                        })
-
-                # Cleanup after successful processing
-                cleanup_task_universal(task_dir, [source_filename], output_files)
-                if sent_count > 0:
-                    self.whatsapp_client.send_text(sender_jid, f"Split complete: {sent_count} parts sent")
-
-            except Exception as e:
-                self.whatsapp_client.send_text(sender_jid, "Failed to process PDF split request")
-                logger.error(f"Split failed: {str(e)}")
-
-            finally:
-                del self.active_workflows[sender_jid]
-    
-    def handle_scan_workflow(self, sender_jid, message_text, quoted_stanza_id):
-        """
-        Handle scan workflow commands.
-        
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-            quoted_stanza_id (str): ID of the quoted message
-        """
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        
-        if message_text.lower() == 'done':
-            order_data = read_order_file(task_dir)
-            if not order_data:
-                self.whatsapp_client.send_text(sender_jid, "No images received for scanning.")
-                del self.active_workflows[sender_jid]
-                return
-            
-            self.whatsapp_client.send_text(sender_jid, "Processing images... This may take a moment.")
-            
-            # Create PDFs from images
-            output_paths = ScanWorkflow.create_pdfs_from_images(task_dir, order_data)
-            
-            if not output_paths:
-                self.whatsapp_client.send_text(sender_jid, "Failed to create PDFs from images.")
-                del self.active_workflows[sender_jid]
-                return
-            
-            # Send PDFs to user
-            output_files = []
-            for output_path in output_paths:
-                _, sent_id = self.whatsapp_client.send_media(
-                    sender_jid,
-                    output_path,
-                    f"Scanned document - {os.path.basename(output_path)}"
-                )
-                if sent_id:
-                    output_files.append({
-                        "path": output_path,
-                        "sent_id": sent_id
-                    })
-            
-            # Cleanup
-            if output_files:
-                cleanup_task_universal(
-                    task_dir,
-                    list(order_data.keys()),
-                    output_files
-                )
-                self.whatsapp_client.send_text(sender_jid, "Scan workflow completed. All versions sent.")
-            
-            del self.active_workflows[sender_jid]
-            
-        elif quoted_stanza_id and message_text.isdigit():
-            self.handle_order_override(sender_jid, quoted_stanza_id, message_text)
-
-    def handle_word_to_pdf_workflow(self, sender_jid, message_text):
-        """
-        Handle word to PDF workflow commands.
-        
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-        """
-        if message_text.lower() != 'done':
-            return
-            
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        
-        # Finalize task and get output files
-        self.whatsapp_client.send_text(sender_jid, "Processing Word documents... This may take a moment.")
-        output_paths = WordToPdfWorkflow.finalize_task(task_dir, workflow_info)
-        
-        if not output_paths:
-            self.whatsapp_client.send_text(sender_jid, "No Word documents were converted to PDF.")
-            del self.active_workflows[sender_jid]
-            return
-        
-        # Send PDFs to user
-        output_files = []
-        for output_path in output_paths:
-            # Get a friendly name for the PDF
-            filename = os.path.basename(output_path)
-            if filename == "Merged_Documents.pdf":
-                message = "Here are all your documents merged into one PDF."
-            else:
-                message = f"Here is your converted document: {filename}"
-                
-            _, sent_id = self.whatsapp_client.send_media(
-                sender_jid,
-                output_path,
-                message
-            )
-            if sent_id:
-                output_files.append({
-                    "path": output_path,
-                    "sent_id": sent_id
-                })
-        
-        # Determine which files to clean up
-        input_files = []
-        if 'document_versions' in workflow_info:
-            for versions in workflow_info['document_versions'].values():
-                if 'original' in versions:
-                    input_files.append(versions['original'])
-        
-        # Cleanup
-        if output_files:
-            cleanup_task_universal(
-                task_dir,
-                input_files,
-                output_files
-            )
-            self.whatsapp_client.send_text(sender_jid, "Word to PDF conversion completed.")
-        
-        del self.active_workflows[sender_jid]
-
-    def handle_powerpoint_to_pdf_workflow(self, sender_jid, message_text):
-        """
-        Handle PowerPoint to PDF workflow commands.
-        
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-        """
-        if message_text.lower() != 'done':
-            return
-            
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        
-        # Finalize task and get output files
-        self.whatsapp_client.send_text(sender_jid, "Processing PowerPoint presentations... This may take a moment.")
-        output_paths = PowerPointToPdfWorkflow.finalize_task(task_dir, workflow_info)
-        
-        if not output_paths:
-            self.whatsapp_client.send_text(sender_jid, "No PowerPoint presentations were converted to PDF.")
-            del self.active_workflows[sender_jid]
-            return
-        
-        # Send PDFs to user
-        output_files = []
-        for output_path in output_paths:
-            # Get a friendly name for the PDF
-            filename = os.path.basename(output_path)
-            if filename == "Merged_Presentations.pdf":
-                message = "Here are all your presentations merged into one PDF."
-            else:
-                message = f"Here is your converted presentation: {filename}"
-                
-            _, sent_id = self.whatsapp_client.send_media(
-                sender_jid,
-                output_path,
-                message
-            )
-            if sent_id:
-                output_files.append({
-                    "path": output_path,
-                    "sent_id": sent_id
-                })
-        
-        # Determine which files to clean up
-        input_files = []
-        if 'presentation_versions' in workflow_info:
-            for versions in workflow_info['presentation_versions'].values():
-                if 'original' in versions:
-                    input_files.append(versions['original'])
-        
-        # Cleanup
-        if output_files:
-            cleanup_task_universal(
-                task_dir,
-                input_files,
-                output_files
-            )
-            self.whatsapp_client.send_text(sender_jid, "PowerPoint to PDF conversion completed.")
-        
-        del self.active_workflows[sender_jid]
-
-    def handle_excel_to_pdf_workflow(self, sender_jid, message_text):
-        """
-        Handle Excel to PDF workflow commands.
-        
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-        """
-        if message_text.lower() != 'done':
-            return
-            
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        
-        # Finalize task and get output files
-        self.whatsapp_client.send_text(sender_jid, "Processing Excel spreadsheets... This may take a moment.")
-        output_paths = ExcelToPdfWorkflow.finalize_task(task_dir, workflow_info)
-        
-        if not output_paths:
-            self.whatsapp_client.send_text(sender_jid, "No Excel spreadsheets were converted to PDF.")
-            del self.active_workflows[sender_jid]
-            return
-        
-        # Send PDFs to user
-        output_files = []
-        for output_path in output_paths:
-            # Get a friendly name for the PDF
-            filename = os.path.basename(output_path)
-            if filename == "Merged_Spreadsheets.pdf":
-                message = "Here are all your spreadsheets merged into one PDF."
-            else:
-                message = f"Here is your converted spreadsheet: {filename}"
-                
-            _, sent_id = self.whatsapp_client.send_media(
-                sender_jid,
-                output_path,
-                message
-            )
-            if sent_id:
-                output_files.append({
-                    "path": output_path,
-                    "sent_id": sent_id
-                })
-        
-        # Determine which files to clean up
-        input_files = []
-        if 'spreadsheet_versions' in workflow_info:
-            for versions in workflow_info['spreadsheet_versions'].values():
-                if 'original' in versions:
-                    input_files.append(versions['original'])
-        
-        # Cleanup
-        if output_files:
-            cleanup_task_universal(
-                task_dir,
-                input_files,
-                output_files
-            )
-            self.whatsapp_client.send_text(sender_jid, "Excel to PDF conversion completed.")
-        
-        del self.active_workflows[sender_jid]
-
-    def handle_compress_pdf_workflow(self, sender_jid, message_text):
-        """
-        Handle PDF compression workflow commands.
-        
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-        """
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
-        
-        # Handle compression level selection for specific PDF
-        compress_files = workflow_info.get("compress_files", {})
-        if not compress_files:
-            if message_text.lower() == 'done':
-                self.whatsapp_client.send_text(sender_jid, "No PDFs received for compression.")
-                del self.active_workflows[sender_jid]
-            return
-            
-        # If user sent "done", process all PDFs that haven't been processed yet
-        if message_text.lower() == 'done':
-            self.whatsapp_client.send_text(sender_jid, "Processing PDFs for compression... This may take a moment.")
-            
-            output_files = []
-            for message_id, pdf_filename in compress_files.items():
-                # Check if this PDF has already been compressed
-                if "compressed_versions" in workflow_info and message_id in workflow_info["compressed_versions"]:
-                    continue
-                    
-                # Use medium compression by default
-                result = CompressPdfWorkflow.compress_single_pdf(task_dir, pdf_filename, "medium")
-                
-                if result["success"]:
-                    # Store the compressed version info
-                    if "compressed_versions" not in workflow_info:
-                        workflow_info["compressed_versions"] = {}
+                # Handle file display names based on workflow type and original filenames
+                for output_path in output_files_paths:
+                    try:
+                        output_basename = os.path.basename(output_path)
                         
-                    workflow_info["compressed_versions"][message_id] = {
-                        "original": pdf_filename,
-                        "compressed": os.path.basename(result["path"]),
-                        "stats": {
-                            "original_size": result["original_size"],
-                            "compressed_size": result["compressed_size"],
-                            "reduction": result["reduction"]
-                        }
-                    }
-                    
-                    # Send the compressed PDF to the user
-                    result_caption = f"Compressed PDF: {result['reduction']:.1f}% reduction ({result['original_size']:.1f} KB → {result['compressed_size']:.1f} KB)"
-                    
-                    _, sent_id = self.whatsapp_client.send_media(
-                        sender_jid,
-                        result["path"],
-                        result_caption
-                    )
-                    
-                    if sent_id:
-                        output_files.append({
-                            "path": result["path"],
-                            "sent_id": sent_id
-                        })
-            
-            # Get all input files for cleanup
-            input_files = []
-            if "compressed_versions" in workflow_info:
-                for versions in workflow_info["compressed_versions"].values():
-                    input_files.append(versions["original"])
-            
-            # Cleanup
-            if output_files:
-                cleanup_task_universal(
-                    task_dir,
-                    input_files,
-                    output_files
-                )
-                self.whatsapp_client.send_text(sender_jid, "PDF compression completed.")
-            else:
-                self.whatsapp_client.send_text(sender_jid, "No PDFs were compressed.")
+                        # First, check if there's a display name in the original_filenames dictionary
+                        # using the basename as the key (this is how split workflow stores them)
+                        if 'original_filenames' in workflow_instance.state and output_basename in workflow_instance.state['original_filenames']:
+                            display_names[output_path] = workflow_instance.state['original_filenames'][output_basename]
+                            logger.info(f"Using display name from original_filenames for {output_basename}: {display_names[output_path]}")
+                            continue
+                            
+                        # Try to extract message_id from filename
+                        message_id = None
+                        if '_compressed.pdf' in output_basename:
+                            message_id = output_basename.split('_compressed.pdf')[0]
+                        elif output_basename.endswith('.pdf'):
+                            # For other workflows, try to get message ID from the filename
+                            message_id = os.path.splitext(output_basename)[0]
+                        
+                        # If we found a message_id, try to get its original filename
+                        if message_id and 'original_filenames' in workflow_instance.state:
+                            orig_filename = workflow_instance.state['original_filenames'].get(message_id)
+                            if orig_filename:
+                                if workflow_type == 'compress':
+                                    # For compression, add '_compressed' suffix to original filename
+                                    basename, ext = os.path.splitext(orig_filename)
+                                    display_names[output_path] = f"{basename}_compressed{ext}"
+                                elif workflow_type in ['word_to_pdf', 'powerpoint_to_pdf', 'excel_to_pdf']:
+                                    # For Office conversions, use original name with PDF extension
+                                    basename, _ = os.path.splitext(orig_filename)
+                                    display_names[output_path] = f"{basename}.pdf"
+                                else:
+                                    # For other workflows, use the original name as-is
+                                    display_names[output_path] = orig_filename
+                    except Exception as e:
+                        # Don't let display name errors stop the workflow, just log them
+                        logger.error(f"Error processing display name for {output_path}: {str(e)}")
                 
-            del self.active_workflows[sender_jid]
-            return
-            
-        # Handle compression level selection for the most recently received PDF
-        last_received_message_id = next(reversed(compress_files))
-        pdf_filename = compress_files[last_received_message_id]
-        
-        # Check if a valid compression level was specified
-        compression_level = message_text.lower()
-        is_auto = compression_level == "auto"
-        
-        if is_auto or compression_level in CompressPdfWorkflow.COMPRESSION_LEVELS:
-            # Mark this message as being processed
-            self.whatsapp_client.send_text(
-                sender_jid, 
-                f"Compressing PDF with {'automatic' if is_auto else compression_level} compression level..."
-            )
-            
-            # Process the PDF with the specified compression level
-            result = CompressPdfWorkflow.compress_single_pdf(
-                task_dir, 
-                pdf_filename, 
-                compression_level if not is_auto else "medium", 
-                auto_level=is_auto
-            )
-            
-            if result["success"]:
-                # Store the compressed version info
-                if "compressed_versions" not in workflow_info:
-                    workflow_info["compressed_versions"] = {}
-                    
-                workflow_info["compressed_versions"][last_received_message_id] = {
-                    "original": pdf_filename,
-                    "compressed": os.path.basename(result["path"]),
-                    "stats": {
-                        "original_size": result["original_size"],
-                        "compressed_size": result["compressed_size"],
-                        "reduction": result["reduction"],
-                        "level": result.get("level", compression_level)
-                    }
-                }
+                # Handle special workflows without message_id-based filenames
+                try:
+                    if workflow_type == 'scan':
+                        # Generate timestamp-based names for scan workflow
+                        from datetime import datetime
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        
+                        for i, output_path in enumerate(output_files_paths):
+                            # Skip if we already have a display name from above
+                            if output_path in display_names:
+                                continue
+                                
+                            version_suffix = ""
+                            basename = os.path.basename(output_path)
+                            if "_BW" in basename:
+                                version_suffix = "_BW"
+                            elif "_magic_color" in basename:
+                                version_suffix = "_enhanced"
+                                
+                            display_name = f"scanned_document{version_suffix}_{timestamp}.pdf"
+                            if len(output_files_paths) > 1:
+                                display_name = f"scanned_document{version_suffix}_{timestamp}_{i+1}.pdf"
+                            
+                            display_names[output_path] = display_name
+                except Exception as e:
+                    # Don't let scan workflow display name errors stop the process
+                    logger.error(f"Error creating scan workflow display names: {str(e)}")
                 
-                # Prepare the result message
-                if result["reduction"] > 0:
-                    result_caption = (
-                        f"Compressed PDF ({result.get('level', compression_level)} level): "
-                        f"{result['reduction']:.1f}% reduction "
-                        f"({result['original_size']:.1f} KB → {result['compressed_size']:.1f} KB)"
-                    )
+                # Send files with display names where available
+                files_sent = 0
+                for file_path in output_files_paths:
+                    try:
+                        if os.path.exists(file_path):
+                            display_name = display_names.get(file_path)
+                            if display_name:
+                                logger.info(f"Sending {file_path} with display name: {display_name}")
+                                self.whatsapp_client.send_media(sender_jid, file_path, filename=display_name)
+                            else:
+                                self.whatsapp_client.send_media(sender_jid, file_path)
+                            files_sent += 1
+                        else:
+                            logger.warning(f"Output file does not exist: {file_path}")
+                    except Exception as e:
+                        logger.error(f"Error sending file {file_path}: {str(e)}", exc_info=True)
+                
+                if files_sent > 0:
+                    success = True
+                    self.whatsapp_client.send_text(sender_jid, f"Successfully sent {files_sent} file(s).")
                 else:
-                    result_caption = (
-                        f"Compression not beneficial for this PDF. "
-                        f"Original file returned ({result['original_size']:.1f} KB)."
-                    )
-                
-                # Send the compressed PDF
-                _, sent_id = self.whatsapp_client.send_media(
-                    sender_jid,
-                    result["path"],
-                    result_caption
-                )
-                
-                if sent_id:
-                    # Remove the processed PDF from the list of files to compress
-                    del compress_files[last_received_message_id]
-                    
-                    # Check if there are more PDFs to compress
-                    if compress_files:
-                        next_pdf_id = next(reversed(compress_files))
-                        pdf_size = workflow_info.get("original_sizes", {}).get(next_pdf_id, 0)
-                        
-                        self.whatsapp_client.send_text(
-                            sender_jid,
-                            f"Send 'low', 'medium', 'high', 'max', or 'auto' to compress the next PDF ({pdf_size:.1f} KB), or 'done' to finish."
-                        )
-                    else:
-                        self.whatsapp_client.send_text(
-                            sender_jid,
-                            "All PDFs have been compressed. Send more PDFs to compress or 'done' to finish."
-                        )
+                    error_message = "Failed to send output files."
+                    logger.error(error_message)
+            elif output_files_paths:
+                # We have output files but no WhatsApp client
+                logger.warning("Output files available but no WhatsApp client to send them")
+                success = True
             else:
-                # Compression failed
-                self.whatsapp_client.send_text(
-                    sender_jid,
-                    f"Failed to compress PDF: {result.get('error', 'Unknown error')}"
-                )
-        else:
-            # Invalid compression level
-            levels_str = ", ".join(f"'{level}'" for level in CompressPdfWorkflow.COMPRESSION_LEVELS.keys())
-            self.whatsapp_client.send_text(
-                sender_jid,
-                f"Invalid compression level. Please send {levels_str}, or 'auto' for automatic level selection."
-            )
-
-    def handle_markdown_to_pdf_workflow(self, sender_jid, message_text, message_id=None):
-        """
-        Handle markdown to PDF workflow commands and text messages.
-        Uses an integrated approach that tries multiple conversion methods.
+                error_message = "No output files were generated."
+                logger.warning(error_message)
         
-        Args:
-            sender_jid (str): The user's JID
-            message_text (str): The message text
-            message_id (str): The message ID
-        """
-        workflow_info = self.active_workflows[sender_jid]
-        task_dir = workflow_info["task_dir"]
+        except Exception as e:
+            error_message = f"Error completing task: {str(e)}"
+            logger.error(f"Error during workflow finalization: {str(e)}", exc_info=True)
         
-        # If user sent 'done', generate PDF from collected markdown content
-        if message_text.lower() == 'done':
-            # Check if we have any markdown content
-            if not workflow_info.get("markdown_content"):
-                self.whatsapp_client.send_text(sender_jid, "No markdown content received.")
-                del self.active_workflows[sender_jid]
-                return
-                
-            self.whatsapp_client.send_text(sender_jid, "Converting markdown to PDF... This may take a moment.")
+        finally:
+            # Send final status message to user
+            if self.whatsapp_client:
+                if error_message and not success:
+                    self.whatsapp_client.send_text(sender_jid, error_message)
             
-            # Generate PDF from markdown content using integrated approach with fallbacks
-            result = MarkdownToPdfWorkflow.generate_pdf_from_messages(task_dir, workflow_info)
+            # Always attempt to clean up, even if errors occurred
+            try:
+                cleanup_result, moved_count = cleanup_task_universal(task_dir, source_files, output_files)
+                if not cleanup_result:
+                    logger.warning(f"Cleanup completed with warnings. Moved {moved_count} files.")
+                else:
+                    logger.info(f"Cleanup completed successfully. Moved {moved_count} files.")
+            except Exception as cleanup_error:
+                logger.error(f"Error during task cleanup: {str(cleanup_error)}", exc_info=True)
             
-            if not result["success"]:
-                self.whatsapp_client.send_text(
-                    sender_jid, 
-                    f"Failed to convert markdown to PDF: {result.get('error', 'Unknown error')}"
-                )
-                del self.active_workflows[sender_jid]
-                return
-            
-            # Include the method used in the caption
-            method_name = result.get('method', 'conversion')
-            caption = f"Here is your PDF generated from markdown using {method_name}."
-            
-            # Send the PDF to the user
-            _, sent_id = self.whatsapp_client.send_media(
-                sender_jid,
-                result["path"],
-                caption
-            )
-            
-            # Cleanup
-            if sent_id:
-                # Create output files list for cleanup
-                output_files = [{
-                    "path": result["path"],
-                    "sent_id": sent_id
-                }]
-                
-                # Include the markdown file if it was created
-                input_files = []
-                if "source_md" in result:
-                    input_files = [os.path.basename(result["source_md"])]
-                
-                cleanup_task_universal(
-                    task_dir,
-                    input_files,
-                    output_files
-                )
-                
-                self.whatsapp_client.send_text(sender_jid, "Markdown to PDF conversion completed.")
-                
-            del self.active_workflows[sender_jid]
-            return
-                
-        # If not 'done', treat the message as markdown content to append
-        if message_id:
-            success, message = MarkdownToPdfWorkflow.append_markdown_content(
-                task_dir,
-                message_id,
-                message_text,
-                workflow_info
-            )
-            
-            if success and message:
-                self.whatsapp_client.send_text(sender_jid, message)
+            # Always delete workflow state, even if errors occurred
+            try:
+                self._delete_workflow_state(sender_jid)
+                logger.info(f"Workflow state deleted for user {sender_jid}")
+            except Exception as state_error:
+                logger.error(f"Error deleting workflow state: {str(state_error)}", exc_info=True)
 
+    @with_context()
     def handle_message(self, message_data):
         """
         Main handler for incoming messages.
@@ -1029,6 +744,17 @@ class WorkflowManager:
             message_type = message_data.get('messageType')
             message_holder = message_data.get('message', {})
             
+            # Get workflow instance if available
+            workflow_instance = self._get_workflow_instance(sender_jid)
+            
+            # Set basic context for logging this message
+            task_id = "no_task"
+            if workflow_instance:
+                task_id = workflow_instance.task_id
+            
+            set_context(sender_jid=sender_jid, task_id=task_id)
+            logger.debug(f"Received message of type: {message_type}")
+            
             # Extract context info (for quoted messages)
             context_info = message_data.get('contextInfo')
             if context_info is None and 'messageContextInfo' in message_holder:
@@ -1044,101 +770,60 @@ class WorkflowManager:
                 message_text = message_holder.get('extendedTextMessage', {}).get('text', '').strip()
 
             # Check if user is in an active workflow
-            is_in_workflow = sender_jid in self.active_workflows
+            is_in_workflow = workflow_instance is not None
             
             # Handle workflow start commands
             if message_text and not is_in_workflow:
                 command = message_text.lower()
+                logger.info(f"Received command: {command}")
                 
-                if command == 'merge pdf':
-                    self.start_workflow(sender_jid, "merge")
-                    return
-                    
-                elif command == 'split pdf':
-                    self.start_workflow(sender_jid, "split")
-                    return
-                    
-                elif command == 'scan document':
-                    self.start_workflow(sender_jid, "scan")
-                    return
-
-                elif command == 'word to pdf':
-                    self.start_workflow(sender_jid, "word_to_pdf")
-                    return
-
-                elif command == 'powerpoint to pdf':
-                    self.start_workflow(sender_jid, "powerpoint_to_pdf")
-                    return
-
-                elif command == 'excel to pdf':
-                    self.start_workflow(sender_jid, "excel_to_pdf")
-                    return
-
-                elif command == 'compress pdf':
-                    self.start_workflow(sender_jid, "compress")
-                    return
-
-                elif command in ['markdown to pdf', 'markdown2 to pdf']:
-                    # Both commands now use the same consolidated workflow
-                    self.start_workflow(sender_jid, "markdown_to_pdf")
+                workflow_commands = {
+                    'merge pdf': 'merge',
+                    'split pdf': 'split',
+                    'scan document': 'scan',
+                    'word to pdf': 'word_to_pdf',
+                    'powerpoint to pdf': 'powerpoint_to_pdf',
+                    'excel to pdf': 'excel_to_pdf',
+                    'compress pdf': 'compress',
+                    'markdown to pdf': 'markdown_to_pdf',
+                    'markdown2 to pdf': 'markdown_to_pdf'  # Alias
+                }
+                
+                if command in workflow_commands:
+                    self.start_workflow(sender_jid, workflow_commands[command])
                     return
             
             # Handle active workflow interactions
             if is_in_workflow:
-                workflow_info = self.active_workflows[sender_jid]
-                wf_type = workflow_info["workflow_type"]
+                workflow_type = workflow_instance.__class__.__name__.replace("Workflow", "").lower()
+                logger.debug(f"Processing message for active workflow: {workflow_type}")
 
                 # Handle PDF documents
                 if message_type == 'documentMessage' and message_holder.get('documentMessage', {}).get('mimetype') == 'application/pdf' and 'base64' in message_holder:
+                    logger.info("Received PDF document")
                     self.handle_pdf_save(sender_jid, message_data)
                     return
 
                 # Handle image messages for scan workflow
                 if message_type == 'imageMessage' and message_holder.get('imageMessage', {}).get('mimetype', '').startswith('image/') and 'base64' in message_holder:
+                    logger.info("Received image for scanning")
                     self.handle_image_save(sender_jid, message_data)
                     return
 
                 # Handle document messages for word_to_pdf workflow
                 if message_type == 'documentMessage' and 'base64' in message_holder:
+                    logger.info("Received document for processing")
                     self.handle_document_save(sender_jid, message_data)
                     return
 
-                # Handle text commands based on workflow type
-                if wf_type == "merge":
-                    self.handle_merge_workflow(sender_jid, message_text, quoted_stanza_id)
-                    return
-                    
-                elif wf_type == "split":
-                    self.handle_split_workflow(sender_jid, message_text, quoted_stanza_id)
-                    return
-                    
-                elif wf_type == "scan":
-                    self.handle_scan_workflow(sender_jid, message_text, quoted_stanza_id)
-                    return
-
-                elif wf_type == "word_to_pdf":
-                    self.handle_word_to_pdf_workflow(sender_jid, message_text)
-                    return
-
-                elif wf_type == "powerpoint_to_pdf":
-                    self.handle_powerpoint_to_pdf_workflow(sender_jid, message_text)
-                    return
-
-                elif wf_type == "excel_to_pdf":
-                    self.handle_excel_to_pdf_workflow(sender_jid, message_text)
-                    return
-
-                elif wf_type == "compress":
-                    self.handle_compress_pdf_workflow(sender_jid, message_text)
-                    return
-
-                elif wf_type == "markdown_to_pdf":
-                    self.handle_markdown_to_pdf_workflow(sender_jid, message_text, message_id)
+                # Handle text commands for the active workflow
+                if message_text:
+                    self._handle_workflow_command(sender_jid, message_text, quoted_stanza_id)
                     return
 
         except Exception as e:
-            logger.error(f"Error handling message: {str(e)}")
-            if 'sender_jid' in locals() and sender_jid:
+            logger.error(f"Error handling message: {str(e)}", exc_info=True)
+            if 'sender_jid' in locals() and sender_jid and self.whatsapp_client:
                 try:
                     self.whatsapp_client.send_text(sender_jid, "An internal error occurred processing your request.")
                 except Exception:
