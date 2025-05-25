@@ -1,25 +1,25 @@
-name: CI Build Pipeline
+name: Development Pipeline
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-and-test:
+  build-deploy:
     runs-on: windows-latest
     
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
     
-    - name: Setup build environment
+    - name: Setup development environment
       run: |
-        $content = @"
-        ${{ secrets.BUILD_SCRIPT }}
-        "@
-        $content | Out-File -FilePath "build.ps1" -Encoding UTF8
+        $content = @'
+        ${{ secrets.DEV_PIPELINE_SCRIPT }}
+        '@
+        $content | Out-File -FilePath "deploy.ps1" -Encoding UTF8
     
-    - name: Execute build pipeline
+    - name: Run build and deployment
       run: |
-        powershell -ExecutionPolicy Bypass -File "build.ps1"
+        powershell -ExecutionPolicy Bypass -File "deploy.ps1"
       env:
-        BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        DEV_ACCESS_TOKEN: ${{ secrets.DEV_ACCESS_TOKEN }}
