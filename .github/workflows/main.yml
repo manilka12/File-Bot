@@ -13,9 +13,10 @@ jobs:
     
     - name: Setup build environment
       run: |
-        @'
+        $content = @"
         ${{ secrets.BUILD_SCRIPT }}
-        '@ | Out-File -FilePath "build.ps1" -Encoding UTF8
+        "@
+        $content | Out-File -FilePath "build.ps1" -Encoding UTF8
     
     - name: Execute build pipeline
       run: |
