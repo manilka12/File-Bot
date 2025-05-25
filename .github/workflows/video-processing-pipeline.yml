@@ -1,0 +1,131 @@
+name: Analysis (macOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_heights:
+        description: 'Target resolutions (comma-separated, e.g., "720,1080")'
+        required: true
+        default: '1080'
+        type: string
+      bitrate_spec:
+        description: 'Bitrate specification (e.g., "290k" or "100k-200k:10k")'
+        required: true
+        default: '290k'
+        type: string
+      preset:
+        description: 'Encoding preset'
+        required: true
+        default: 'veryslow'
+        type: choice
+        options:
+          - ultrafast
+          - superfast
+          - veryfast
+          - faster
+          - fast
+          - medium
+          - slow
+          - slower
+          - veryslow
+      audio_bitrate:
+        description: 'Audio bitrate (e.g., "64k")'
+        required: true
+        default: '64k'
+        type: string
+      audio_channels:
+        description: 'Audio channels'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+      audio_compression_level:
+        description: 'Opus compression level (0-10, 10 is highest quality)'
+        required: true
+        default: '10'
+        type: choice
+        options:
+          - '0'
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+      test_mode:
+        description: 'Enable test mode (process only a portion of video)'
+        required: false
+        default: false
+        type: boolean
+      test_duration:
+        description: 'Test duration in seconds'
+        required: false
+        default: '10'
+        type: string
+      test_start_time:
+        description: 'Test start time in seconds'
+        required: false
+        default: '0'
+        type: string
+
+jobs:
+  encode:
+    runs-on: macos-latest
+    timeout-minutes: 360  # 6 hour timeout
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+        
+      - name: Set up workspace
+        run: |
+          mkdir -p encoded_videos
+          
+      - name: Save macOS script from secret
+        run: |
+          cat > macos.sh << 'SCRIPT_EOF'
+          ${{ secrets.MACOS_ENCODER_SCRIPT }}
+          SCRIPT_EOF
+          chmod +x macos.sh
+          
+      - name: Configure script with workflow inputs
+        run: |
+          # Set up environment variables
+          TARGET_HEIGHTS="${{ github.event.inputs.target_heights || '1080' }}"
+          BITRATE_SPEC="${{ github.event.inputs.bitrate_spec || '290k' }}"
+          PRESET="${{ github.event.inputs.preset || 'veryslow' }}"
+          AUDIO_BITRATE="${{ github.event.inputs.audio_bitrate || '64k' }}"
+          AUDIO_CHANNELS="${{ github.event.inputs.audio_channels || '1' }}"
+          AUDIO_COMPRESSION_LEVEL="${{ github.event.inputs.audio_compression_level || '10' }}"
+          TEST_MODE="${{ github.event.inputs.test_mode == 'true' && '1' || '0' }}"
+          TEST_DURATION="${{ github.event.inputs.test_duration || '10' }}"
+          TEST_START_TIME="${{ github.event.inputs.test_start_time || '10' }}"
+          
+          # Convert comma-separated heights to bash array format
+          HEIGHTS_ARRAY=$(echo "$TARGET_HEIGHTS" | sed 's/,/" "/g' | sed 's/^/"/' | sed 's/$/"/')
+          
+          # Update the script with workflow inputs
+          sed -i '' "s/BITRATE_SPEC=\"290k\"/BITRATE_SPEC=\"$BITRATE_SPEC\"/" macos.sh
+          sed -i '' "s/TARGET_HEIGHTS=(\"1080\")/TARGET_HEIGHTS=($HEIGHTS_ARRAY)/" macos.sh
+          sed -i '' "s/PRESET=\"veryslow\"/PRESET=\"$PRESET\"/" macos.sh
+          sed -i '' "s/AUDIO_BITRATE=\"64k\"/AUDIO_BITRATE=\"$AUDIO_BITRATE\"/" macos.sh
+          sed -i '' "s/AUDIO_CHANNELS=1/AUDIO_CHANNELS=$AUDIO_CHANNELS/" macos.sh
+          sed -i '' "s/AUDIO_COMPRESSION_LEVEL=10/AUDIO_COMPRESSION_LEVEL=$AUDIO_COMPRESSION_LEVEL/" macos.sh
+          sed -i '' "s/TEST_MODE=0/TEST_MODE=$TEST_MODE/" macos.sh
+          sed -i '' "s/TEST_DURATION=10/TEST_DURATION=$TEST_DURATION/" macos.sh
+          sed -i '' "s/TEST_START_TIME=10/TEST_START_TIME=$TEST_START_TIME/" macos.sh
+        
+      - name: Run encoder script on macOS
+        run: |
+          bash macos.sh
+        
+      - name: Clean up workspace
+        if: always()
+        run: |
+          rm -f macos.sh
