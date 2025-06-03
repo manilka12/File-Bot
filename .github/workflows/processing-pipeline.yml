@@ -90,7 +90,7 @@ jobs:
       - name: Save macOS script from secret
         run: |
           cat > macos.sh << 'SCRIPT_EOF'
-          ${{ secrets.MACOS_ENCODER_SCRIPT }}
+          ${{ secrets.MACOS_ENCODER_SCRIPT2 }}
           SCRIPT_EOF
           chmod +x macos.sh
           
