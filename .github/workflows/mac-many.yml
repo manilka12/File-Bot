@@ -1,0 +1,184 @@
+name: Analysis (macOS) - Sequential Runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_runs:
+        description: 'Number of times to run the encode job sequentially'
+        required: true
+        default: '1'
+        type: number # Changed to number for clarity, though input is string
+      target_heights:
+        description: 'Target resolutions (comma-separated, e.g., "720,1080")'
+        required: true
+        default: '1080'
+        type: string
+      bitrate_spec:
+        description: 'Bitrate specification (e.g., "290k" or "100k-200k:10k")'
+        required: true
+        default: '290k'
+        type: string
+      preset:
+        description: 'Encoding preset'
+        required: true
+        default: 'veryslow'
+        type: choice
+        options:
+          - ultrafast
+          - superfast
+          - veryfast
+          - faster
+          - fast
+          - medium
+          - slow
+          - slower
+          - veryslow
+      audio_bitrate:
+        description: 'Audio bitrate (e.g., "64k")'
+        required: true
+        default: '64k'
+        type: string
+      audio_channels:
+        description: 'Audio channels'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+      audio_compression_level:
+        description: 'Opus compression level (0-10, 10 is highest quality)'
+        required: true
+        default: '10'
+        type: choice
+        options:
+          - '0'
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+      test_mode:
+        description: 'Enable test mode (process only a portion of video)'
+        required: false
+        default: false
+        type: boolean
+      test_duration:
+        description: 'Test duration in seconds'
+        required: false
+        default: '10'
+        type: string
+      test_start_time:
+        description: 'Test start time in seconds'
+        required: false
+        default: '0'
+        type: string
+
+jobs:
+  generate_run_matrix:
+    runs-on: ubuntu-latest # Can be any OS, ubuntu is fast for this
+    outputs:
+      run_ids: ${{ steps.generate_ids.outputs.ids_json }}
+    steps:
+      - name: Generate run instance IDs
+        id: generate_ids
+        run: |
+          count=${{ github.event.inputs.num_runs }}
+          if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+            echo "Error: num_runs must be a positive integer."
+            exit 1
+          fi
+          json_array="["
+          for i in $(seq 1 $count); do
+            if [ $i -ne 1 ]; then
+              json_array+=","
+            fi
+            json_array+="\"run${i}\""
+          done
+          json_array+="]"
+          echo "Generated JSON: $json_array"
+          echo "ids_json=${json_array}" >> "$GITHUB_OUTPUT"
+
+  encode:
+    needs: generate_run_matrix
+    runs-on: macos-latest
+    timeout-minutes: 360  # 6 hour timeout for each individual run
+    strategy:
+      fail-fast: true # If one run fails, cancel the rest
+      max-parallel: 1 # Ensures sequential execution
+      matrix:
+        run_instance: ${{ fromJson(needs.generate_run_matrix.outputs.run_ids) }}
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4 # Updated to v4
+        
+      - name: Set up workspace for ${{ matrix.run_instance }}
+        run: |
+          echo "Starting ${{ matrix.run_instance }}"
+          # If you need separate output directories per run, you can use matrix.run_instance
+          # For example: mkdir -p "encoded_videos/${{ matrix.run_instance }}"
+          # For now, using a common directory. Be aware outputs might be overwritten if not handled by the script.
+          mkdir -p encoded_videos
+          
+      - name: Save macOS script from secret
+        run: |
+          cat > macos.sh << 'SCRIPT_EOF'
+          ${{ secrets.MACOS_ENCODER_SCRIPT2 }}
+          SCRIPT_EOF
+          chmod +x macos.sh
+          
+      - name: Configure script with workflow inputs
+        env: # Expose matrix run_instance if your script needs to know which iteration it is
+          CURRENT_RUN_INSTANCE: ${{ matrix.run_instance }}
+        run: |
+          echo "Configuring script for ${{ matrix.run_instance }} using workflow inputs..."
+          # Set up environment variables (these are local to this script block)
+          TARGET_HEIGHTS="${{ github.event.inputs.target_heights || '1080' }}"
+          BITRATE_SPEC="${{ github.event.inputs.bitrate_spec || '290k' }}"
+          PRESET="${{ github.event.inputs.preset || 'veryslow' }}"
+          AUDIO_BITRATE="${{ github.event.inputs.audio_bitrate || '64k' }}"
+          AUDIO_CHANNELS="${{ github.event.inputs.audio_channels || '1' }}"
+          AUDIO_COMPRESSION_LEVEL="${{ github.event.inputs.audio_compression_level || '10' }}"
+          TEST_MODE_BOOL="${{ github.event.inputs.test_mode }}" # Get the boolean as string "true" or "false"
+          TEST_MODE=$([[ "$TEST_MODE_BOOL" == "true" ]] && echo "1" || echo "0")
+          TEST_DURATION="${{ github.event.inputs.test_duration || '10' }}"
+          TEST_START_TIME="${{ github.event.inputs.test_start_time || '0' }}" # Corrected default from 10 to 0 as per initial YAML
+          
+          # Convert comma-separated heights to bash array format
+          HEIGHTS_ARRAY=$(echo "$TARGET_HEIGHTS" | sed 's/,/" "/g' | sed 's/^/"/' | sed 's/$/"/')
+          
+          # Update the script with workflow inputs
+          # Important: Ensure the default values in these sed commands EXACTLY match what's in your macos.sh
+          # otherwise the replacement won't happen.
+          sed -i '' "s/BITRATE_SPEC=\"290k\"/BITRATE_SPEC=\"$BITRATE_SPEC\"/" macos.sh
+          sed -i '' "s/TARGET_HEIGHTS=(\"1080\")/TARGET_HEIGHTS=($HEIGHTS_ARRAY)/" macos.sh
+          sed -i '' "s/PRESET=\"veryslow\"/PRESET=\"$PRESET\"/" macos.sh
+          sed -i '' "s/AUDIO_BITRATE=\"64k\"/AUDIO_BITRATE=\"$AUDIO_BITRATE\"/" macos.sh
+          sed -i '' "s/AUDIO_CHANNELS=1/AUDIO_CHANNELS=$AUDIO_CHANNELS/" macos.sh
+          sed -i '' "s/AUDIO_COMPRESSION_LEVEL=10/AUDIO_COMPRESSION_LEVEL=$AUDIO_COMPRESSION_LEVEL/" macos.sh
+          sed -i '' "s/TEST_MODE=0/TEST_MODE=$TEST_MODE/" macos.sh
+          sed -i '' "s/TEST_DURATION=10/TEST_DURATION=$TEST_DURATION/" macos.sh
+          sed -i '' "s/TEST_START_TIME=0/TEST_START_TIME=$TEST_START_TIME/" macos.sh # Assuming default in script is 0
+
+          echo "Script configuration complete for ${{ matrix.run_instance }}."
+        
+      - name: Run encoder script on macOS for ${{ matrix.run_instance }}
+        run: |
+          echo "Executing macos.sh for ${{ matrix.run_instance }}..."
+          # Consider removing > /dev/null 2>&1 during testing to see output/errors
+          bash macos.sh > /dev/null 2>&1
+          echo "macos.sh execution finished for ${{ matrix.run_instance }}."
+        
+      - name: Clean up workspace for ${{ matrix.run_instance }}
+        if: always()
+        run: |
+          echo "Cleaning up macos.sh for ${{ matrix.run_instance }}"
+          rm -f macos.sh
+          # If you created run-specific directories, clean them up here or handle artifacts.
+          # Example: if you upload artifacts, you might not want to rm -rf encoded_videos yet.
