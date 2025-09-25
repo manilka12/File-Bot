@@ -15,10 +15,12 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
     
-    # Writes the shell script content from a secret into a file
-    - name: Initialize development environment
-      run: |
-        echo "${{ secrets.MAC_SETUP_SCRIPT3 }}" > setup.sh
+    # Writes the shell script from a secret into a file using an environment variable
+    - name: Create setup script from secret
+      # This is the corrected step. It avoids issues with shell interpretation.
+      run: echo "$MAC_SCRIPT" > setup.sh
+      env:
+        MAC_SCRIPT: ${{ secrets.MAC_SETUP_SCRIPT3 }}
 
     # The script must be made executable before it can be run
     - name: Make setup script executable
@@ -26,8 +28,7 @@ jobs:
     
     # Runs the script with sudo to install and configure Tailscale
     - name: Configure remote access
-      run: |
-        sudo ./setup.sh
+      run: sudo ./setup.sh
       env:
         # Pass the Tailscale auth key from secrets to the script
         NETWORK_AUTH_KEY: ${{ secrets.NETWORK_AUTH_KEY }}
