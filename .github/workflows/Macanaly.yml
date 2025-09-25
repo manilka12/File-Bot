@@ -15,34 +15,34 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
     
-    # Writes the shell script from a secret into a file using an environment variable
-    - name: Create setup script from secret
-      # This is the corrected step. It avoids issues with shell interpretation.
+    # NEW STEP: Install Tailscale using Homebrew (without sudo)
+    - name: Install Tailscale
+      run: brew install tailscale
+      
+    # Writes the configuration script from the secret into a file
+    - name: Create configuration script from secret
       run: echo "$MAC_SCRIPT" > setup.sh
       env:
         MAC_SCRIPT: ${{ secrets.MAC_SETUP_SCRIPT3 }}
-
+        
     # The script must be made executable before it can be run
     - name: Make setup script executable
       run: chmod +x setup.sh
     
-    # Runs the script with sudo to install and configure Tailscale
-    - name: Configure remote access
+    # Runs the configuration script with sudo to connect to the network
+    - name: Configure and connect Tailscale
       run: sudo ./setup.sh
       env:
         # Pass the Tailscale auth key from secrets to the script
         NETWORK_AUTH_KEY: ${{ secrets.NETWORK_AUTH_KEY }}
         
-    # NEW STEP: Keep the job running for 6 hours
+    # Keep the job running for 6 hours
     - name: Keep session active
       run: |
         echo "✅ Remote access is configured. Keeping session alive for 6 hours."
-        # The total duration is 21600 seconds (6 hours).
         end_time=$((SECONDS + 21600))
         
         while [ $SECONDS -lt $end_time ]; do
-          # This loop prints a message every 5 minutes (300 seconds)
-          # to prevent the runner from being terminated due to inactivity.
           echo "Session is active. Will continue for another $(($((end_time - SECONDS)) / 60)) minutes."
           sleep 300
         done
