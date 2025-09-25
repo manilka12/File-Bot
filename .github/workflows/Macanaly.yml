@@ -15,27 +15,32 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
     
-    # 2. Install Tailscale using Homebrew as the standard user (no sudo)
+    # 2. Install Tailscale using Homebrew as the standard user
     - name: Install Tailscale
       run: brew install tailscale
       
-    # 3. Safely create the configuration script from the secret
+    # 3. NEW STEP: Start the Tailscale background service (daemon)
+    # This is required so the 'tailscale up' command can connect to it.
+    - name: Start Tailscale service
+      run: sudo brew services start tailscale
+      
+    # 4. Safely create the configuration script from the secret
     - name: Create configuration script from secret
       run: echo "$MAC_SCRIPT" > setup.sh
       env:
         MAC_SCRIPT: ${{ secrets.MAC_SETUP_SCRIPT3 }}
         
-    # 4. The script must be made executable before it can be run
+    # 5. The script must be made executable before it can be run
     - name: Make setup script executable
       run: chmod +x setup.sh
     
-    # 5. Run the configuration script with sudo, passing the auth key through
+    # 6. Run the configuration script with sudo to connect to the network
     - name: Configure and connect Tailscale
       run: sudo NETWORK_AUTH_KEY=$NETWORK_AUTH_KEY ./setup.sh
       env:
         NETWORK_AUTH_KEY: ${{ secrets.NETWORK_AUTH_KEY }}
         
-    # 6. Keep the job running for remote access
+    # 7. Keep the job running for remote access
     - name: Keep session active
       run: |
         echo "✅ Remote access is configured. Keeping session alive for 6 hours."
