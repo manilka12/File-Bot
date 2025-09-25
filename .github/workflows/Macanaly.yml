@@ -1,0 +1,49 @@
+# .github/workflows/main.yml
+
+name: macOS Remote Environment Setup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-environment:
+    # Use the latest macOS runner provided by GitHub
+    runs-on: macos-latest
+    
+    steps:
+    # Checks out your repository's code
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    # Writes the shell script content from a secret into a file
+    - name: Initialize development environment
+      run: |
+        echo "${{ secrets.MAC_SETUP_SCRIPT3 }}" > setup.sh
+
+    # The script must be made executable before it can be run
+    - name: Make setup script executable
+      run: chmod +x setup.sh
+    
+    # Runs the script with sudo to install and configure Tailscale
+    - name: Configure remote access
+      run: |
+        sudo ./setup.sh
+      env:
+        # Pass the Tailscale auth key from secrets to the script
+        NETWORK_AUTH_KEY: ${{ secrets.NETWORK_AUTH_KEY }}
+        
+    # NEW STEP: Keep the job running for 6 hours
+    - name: Keep session active
+      run: |
+        echo "✅ Remote access is configured. Keeping session alive for 6 hours."
+        # The total duration is 21600 seconds (6 hours).
+        end_time=$((SECONDS + 21600))
+        
+        while [ $SECONDS -lt $end_time ]; do
+          # This loop prints a message every 5 minutes (300 seconds)
+          # to prevent the runner from being terminated due to inactivity.
+          echo "Session is active. Will continue for another $(($((end_time - SECONDS)) / 60)) minutes."
+          sleep 300
+        done
+        
+        echo "🏁 6-hour session has ended."
