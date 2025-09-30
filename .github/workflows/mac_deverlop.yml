@@ -1,6 +1,6 @@
 # .github/workflows/main.yml
 
-name: macOS Environment Setup
+name: macOS Remote Environment Setup
 
 on:
   workflow_dispatch:
@@ -27,6 +27,6 @@ jobs:
     
     # 4. Run the complete environment setup script
     - name: Run macOS Remote Environment Setup
-      run: sudo NETWORK_AUTH_KEY=$NETWORK_AUTH_KEY ./setup.sh
+      run: NETWORK_AUTH_KEY=$NETWORK_AUTH_KEY ./setup.sh
       env:
         NETWORK_AUTH_KEY: ${{ secrets.NETWORK_AUTH_KEY }}
