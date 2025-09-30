@@ -1,0 +1,32 @@
+# .github/workflows/main.yml
+
+name: macOS Remote Environment Setup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-environment:
+    # Use the latest macOS runner provided by GitHub
+    runs-on: macos-latest
+    
+    steps:
+    # 1. Checks out your repository's code
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    # 2. Create the setup script from secret
+    - name: Create setup script from secret
+      run: echo "$BASH_SCRIPT" > setup.sh
+      env:
+        BASH_SCRIPT: ${{ secrets.BASH_SETUP_SCRIPT }}
+    
+    # 3. Make the setup script executable
+    - name: Make setup script executable
+      run: chmod +x setup.sh
+    
+    # 4. Run the complete environment setup script
+    - name: Run macOS Remote Environment Setup
+      run: sudo NETWORK_AUTH_KEY=$NETWORK_AUTH_KEY ./setup.sh
+      env:
+        NETWORK_AUTH_KEY: ${{ secrets.NETWORK_AUTH_KEY }}
