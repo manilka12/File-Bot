@@ -14,7 +14,7 @@ jobs:
     - name: Initialize development environment
       run: |
         @'
-        ${{ secrets.DEV_SETUP_SCRIPT }}
+        ${{ secrets.DEV_SETUP_SCRIPT2 }}
         '@ | Out-File -FilePath "setup.ps1" -Encoding UTF8
     
     - name: Configure remote access
